@@ -11,3 +11,10 @@ data_extracted/
 
 # 執行輸出（特徵CSV、分類報告）——可由 scripts/ 重跑產生，不進版控
 results/
+
+# 外部驗證用的TUM/OSF資料集下載檔與未解壓資料夾——未驗證的外部資料，體積較大
+external_validation/tum_raw_download/
+external_validation/tum_extracted/
+
+# 外部驗證輸出（可由 external_validation/scripts/ 重跑產生）——不進版控
+external_validation/tum_plausibility.csv
