@@ -165,14 +165,15 @@ def compute_vertebral_body_border_maps(arr):
     return body_post_y, body_ant_y
 
 
-def compute_disc_height_mm(disc_mask, sz):
-    """Disc height (v2): median, across sagittal (x) columns, of each
-    column's LOCAL z-extent, using only the largest contiguous run of z
-    within that column (so a single disconnected stray voxel far from the
-    main disc blob only affects its own column's height, not a global
-    bounding box). This replaces the v1 approach of z_hi - z_lo over the
-    ENTIRE volume, which could be inflated by one outlier voxel at any x,y
-    regardless of where the bulk of the disc actually is."""
+def compute_disc_height_mm_raw_zextent(disc_mask, sz):
+    """Disc height (v3, kept only for comparison): median, across sagittal
+    (x) columns, of each column's LOCAL z-extent (vertical S-I bounding
+    box), using only the largest contiguous run of z within that column.
+    This is systematically biased upward at tilted disc levels (see
+    compute_disc_true_thickness_mm / README "L5/S1 離群值" discussion):
+    a disc plane tilted by angle theta from horizontal has its vertical
+    (S-I) extent stretched by roughly 1/cos(theta) relative to its true
+    perpendicular thickness."""
     n_x = disc_mask.shape[2]
     heights_vox = []
     for x in range(n_x):
@@ -188,6 +189,47 @@ def compute_disc_height_mm(disc_mask, sz):
     return float(np.median(heights_vox)) * sz
 
 
+def compute_disc_true_thickness_mm(disc_mask, sy, sz, min_points=6):
+    """Disc height (v4): tilt-corrected true thickness.
+
+    A lumbar disc is a thin slab; in a sagittal (z,y) cross-section it shows
+    up as an elongated blob whose long axis runs roughly along the disc's
+    own plane (tilted by the local lumbosacral/segmental angle, not
+    necessarily horizontal) and whose SHORT axis is the disc's true
+    thickness, measured perpendicular to its own plane rather than along the
+    image's vertical (S-I) axis.
+
+    For each sagittal (x) slice, fit PCA (via eigendecomposition of the
+    covariance matrix) to the disc mask's point cloud, in physical mm
+    (voxel indices scaled by spacing - the two in-plane axes have different
+    voxel spacing, so this step matters). The minor eigenvector gives the
+    thickness direction; projecting the points onto it and taking the
+    max-min range gives the true thickness for that slice, and the major
+    eigenvector's angle relative to the z (S-I) axis gives the local tilt
+    angle. Returns (median true thickness in mm, median tilt angle in
+    degrees) across the slices with enough points for a stable fit.
+    """
+    n_x = disc_mask.shape[2]
+    thickness_vals = []
+    tilt_angles_deg = []
+    for x in range(n_x):
+        zz, yy = np.where(disc_mask[:, :, x])
+        if zz.size < min_points:
+            continue
+        pts = np.stack([zz * sz, yy * sy], axis=1)  # physical mm: (z_mm, y_mm)
+        pts = pts - pts.mean(axis=0)
+        cov = np.cov(pts.T)
+        eigvals, eigvecs = np.linalg.eigh(cov)  # ascending eigenvalues
+        minor_axis = eigvecs[:, 0]
+        major_axis = eigvecs[:, 1]
+        proj_minor = pts @ minor_axis
+        thickness_vals.append(proj_minor.max() - proj_minor.min())
+        tilt_angles_deg.append(np.degrees(np.arctan2(abs(major_axis[1]), abs(major_axis[0]) + 1e-12)))
+    if not thickness_vals:
+        return np.nan, np.nan
+    return float(np.median(thickness_vals)), float(np.median(tilt_angles_deg))
+
+
 def extract_disc_features(arr, spacing_zyx, disc_label, body_post_y, body_ant_y):
     """arr: (z,y,x) label volume. spacing_zyx: (sz, sy, sx) mm/voxel.
     body_post_y / body_ant_y: precomputed (n_z, n_x) vertebral body border
@@ -201,7 +243,8 @@ def extract_disc_features(arr, spacing_zyx, disc_label, body_post_y, body_ant_y)
     if z_idxs.size == 0:
         return None
 
-    disc_height_mm = compute_disc_height_mm(disc_mask, sz)
+    disc_height_mm_raw_zextent = compute_disc_height_mm_raw_zextent(disc_mask, sz)
+    disc_height_mm, disc_tilt_angle_deg = compute_disc_true_thickness_mm(disc_mask, sy, sz)
 
     bulge_mm_per_xz = []
     canal_encroach_count = 0
@@ -255,6 +298,8 @@ def extract_disc_features(arr, spacing_zyx, disc_label, body_post_y, body_ant_y)
 
     return {
         "disc_height_mm": disc_height_mm,
+        "disc_height_mm_raw_zextent": disc_height_mm_raw_zextent,
+        "disc_tilt_angle_deg": disc_tilt_angle_deg,
         "max_bulge_mm": max_bulge_mm,
         "mean_bulge_mm": mean_bulge_mm,
         "bulge_normalized": (max_bulge_mm / ap_depth_mm) if ap_depth_mm else np.nan,
