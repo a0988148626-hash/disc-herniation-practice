@@ -1,5 +1,7 @@
 # Disc_Herniation_Practice — 椎間盤突出 MRI 判讀練習
 
+GitHub（private）：<https://github.com/a0988148626-hash/disc-herniation-practice>
+
 ## 專案定位
 
 這是一個練習專案，目的是為達文西機器人脊椎手術影像演算法工作做準備。跟同作者既有的
