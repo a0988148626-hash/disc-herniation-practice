@@ -49,11 +49,41 @@ DISC_LABEL_BASE = 200
 CC_STRUCTURE = np.ones((3, 3))  # 8-connectivity for 2D connected components
 
 
+MAX_SAGITTAL_SLICE_COUNT = 200  # see is_sagittal_multislice() docstring
+
+
+def is_sagittal_multislice(path: Path) -> bool:
+    """Check that this .mha file actually has the geometry this pipeline
+    assumes: a 2D multi-slice sagittal stack, i.e. few (sparse) slices along
+    the left-right axis (ITK size[0]) and a much larger in-plane extent.
+
+    Discovered during development: not every file in this dataset is such a
+    stack. Some "_t1"/"_t2" files are actually axial reformats with a square
+    512x512 in-plane FOV and only ~17-25 slices along the superior-inferior
+    axis instead (e.g. patient 161's t2 series: ITK size (512, 512, 19)), and
+    every "_t2_SPACE"/"_t1_SPACE" file is a near-isotropic 3D acquisition
+    with size[0]=512 as well. Running the sagittal-slice-by-slice geometric
+    logic on these produces meaningless results (this is what caused the
+    disc_height_mm outlier such as patient 161 level 1's ~60mm "height" -
+    not simple noise, but a genuine orientation mismatch that a median
+    instead of max/min over z does NOT fix). Across the whole dataset,
+    ITK size[0] is cleanly bimodal (<=144 for real sagittal stacks, 512 for
+    these atypical files), so a threshold of 200 separates them with no
+    ambiguous cases.
+    """
+    img = sitk.ReadImage(str(path))
+    return img.GetSize()[0] < MAX_SAGITTAL_SLICE_COUNT
+
+
 def pick_file_for_patient(masks_dir: Path, patient_id: str):
-    """Prefer t2, then t1, then t2_SPACE (document choice as a limitation)."""
+    """Prefer t2, then t1, then t2_SPACE, skipping any candidate whose
+    geometry is not a standard sagittal multi-slice stack (see
+    is_sagittal_multislice). A patient with no sequence passing this check
+    is reported as excluded rather than silently processed with
+    geometrically-invalid assumptions."""
     for suffix in ("t2", "t1", "t2_SPACE", "t1_SPACE"):
         candidate = masks_dir / f"{patient_id}_{suffix}.mha"
-        if candidate.exists():
+        if candidate.exists() and is_sagittal_multislice(candidate):
             return candidate, suffix
     return None, None
 
@@ -135,6 +165,29 @@ def compute_vertebral_body_border_maps(arr):
     return body_post_y, body_ant_y
 
 
+def compute_disc_height_mm(disc_mask, sz):
+    """Disc height (v2): median, across sagittal (x) columns, of each
+    column's LOCAL z-extent, using only the largest contiguous run of z
+    within that column (so a single disconnected stray voxel far from the
+    main disc blob only affects its own column's height, not a global
+    bounding box). This replaces the v1 approach of z_hi - z_lo over the
+    ENTIRE volume, which could be inflated by one outlier voxel at any x,y
+    regardless of where the bulk of the disc actually is."""
+    n_x = disc_mask.shape[2]
+    heights_vox = []
+    for x in range(n_x):
+        zs = np.where(disc_mask[:, :, x].any(axis=1))[0]
+        if zs.size == 0:
+            continue
+        gaps = np.where(np.diff(zs) > 1)[0]
+        runs = np.split(zs, gaps + 1)
+        longest = max(runs, key=len)
+        heights_vox.append(longest.max() - longest.min() + 1)
+    if not heights_vox:
+        return np.nan
+    return float(np.median(heights_vox)) * sz
+
+
 def extract_disc_features(arr, spacing_zyx, disc_label, body_post_y, body_ant_y):
     """arr: (z,y,x) label volume. spacing_zyx: (sz, sy, sx) mm/voxel.
     body_post_y / body_ant_y: precomputed (n_z, n_x) vertebral body border
@@ -148,9 +201,7 @@ def extract_disc_features(arr, spacing_zyx, disc_label, body_post_y, body_ant_y)
     if z_idxs.size == 0:
         return None
 
-    z_lo, z_hi = z_idxs.min(), z_idxs.max()
-    disc_height_vox = (z_hi - z_lo + 1)
-    disc_height_mm = disc_height_vox * sz
+    disc_height_mm = compute_disc_height_mm(disc_mask, sz)
 
     bulge_mm_per_xz = []
     canal_encroach_count = 0
@@ -273,7 +324,9 @@ def main(masks_dir, overview_csv, gradings_csv, output_csv):
         writer.writerows(rows_out)
 
     print(f"Wrote {len(rows_out)} disc-level feature rows to {output_csv}")
-    print(f"Patients with no usable mask file: {len(set(missing_patients))}")
+    print(f"Patients with no usable (sagittal multi-slice) mask file: {len(set(missing_patients))}")
+    if missing_patients:
+        print("  excluded patient ids:", sorted(set(missing_patients), key=int))
     print(f"Disc levels absent from the chosen mask volume: {len(missing_disc_in_mask)}")
     if missing_disc_in_mask[:10]:
         print("  sample:", missing_disc_in_mask[:10])
