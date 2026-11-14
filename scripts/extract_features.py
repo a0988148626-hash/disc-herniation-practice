@@ -16,6 +16,22 @@ Array axes after SimpleITK GetArrayFromImage(): arr[z, y, x]
 (This follows the standard DICOM/ITK LPS convention for an identity direction
 matrix, which is what every file in this dataset uses.)
 
+Vertebral body vs. posterior-element separation
+-------------------------------------------------
+Each sagittal slice (fixed x, 2D plane over z,y) is a real anatomical image
+plane. Within such a slice, the vertebral body and the posterior elements
+(pedicle/lamina/spinous process) are usually two SEPARATE connected
+components of the "vertebra" label, because the spinal canal sits between
+them. We run 2D connected-component labeling (8-connectivity) per sagittal
+slice and classify each component as "body" (anterior) or "posterior
+element" by majority vote of its pixels against the spinal canal's local
+y-position at the matching z rows. Known failure mode: on slices that pass
+through the pedicle, body and posterior elements are physically fused into
+one component; our majority-vote still assigns the whole fused blob to one
+class, which can bias the body's posterior border slightly more posterior
+than the true cortical margin on those particular slices (documented as a
+limitation in the README, not hidden).
+
 Usage:
     python extract_features.py <masks_dir> <overview_csv> <gradings_csv> <output_csv>
 """
@@ -25,10 +41,12 @@ from pathlib import Path
 
 import numpy as np
 import SimpleITK as sitk
+from scipy import ndimage
 
 
 VERTEBRA_LABELS = set(range(1, 26)) | set(range(101, 126))
 DISC_LABEL_BASE = 200
+CC_STRUCTURE = np.ones((3, 3))  # 8-connectivity for 2D connected components
 
 
 def pick_file_for_patient(masks_dir: Path, patient_id: str):
@@ -47,46 +65,81 @@ def load_mask_array(path: Path):
     return arr, (sz, sy, sx)  # return spacing matching array axis order (z,y,x)
 
 
-def vertebral_body_posterior_border(arr, canal_label_mask, z_idx):
-    """At a given z slice (and across x), estimate the posterior-most (max y)
-    voxel of VERTEBRAL BODY (i.e. vertebra voxels anterior to the spinal
-    canal), separately per x column. Returns dict x -> body_posterior_y
-    (np.nan if not found for that x)."""
-    slice_vert = np.isin(arr[z_idx], list(VERTEBRA_LABELS))
-    slice_canal = canal_label_mask[z_idx]
-    n_x = arr.shape[2]
-    result = np.full(n_x, np.nan)
-    for x in range(n_x):
-        canal_ys = np.where(slice_canal[:, x])[0]
-        vert_ys = np.where(slice_vert[:, x])[0]
-        if vert_ys.size == 0:
-            continue
-        if canal_ys.size > 0:
-            canal_centroid_y = canal_ys.mean()
-            body_ys = vert_ys[vert_ys < canal_centroid_y]
+def _classify_components_as_body(labeled, n_components, canal_slice2d):
+    """labeled: 2D int array (z,y) of connected-component ids (0 = background).
+    canal_slice2d: 2D boolean array (z,y) for the spinal canal in the same slice.
+    Returns the set of component ids classified as vertebral BODY (anterior to
+    the canal), using a per-component majority vote against the canal's local
+    y-position at each component pixel's own z row."""
+    n_z = labeled.shape[0]
+    canal_y_per_z = np.full(n_z, np.nan)
+    for z in range(n_z):
+        ys = np.where(canal_slice2d[z])[0]
+        if ys.size:
+            canal_y_per_z[z] = ys.mean()
+    valid_canal = ~np.isnan(canal_y_per_z)
+    canal_overall_mean = canal_y_per_z[valid_canal].mean() if valid_canal.any() else None
+
+    body_components = set()
+    comp_mean_y = {}
+    for comp_id in range(1, n_components + 1):
+        zz, yy = np.where(labeled == comp_id)
+        comp_mean_y[comp_id] = yy.mean()
+        local_canal = canal_y_per_z[zz]
+        has_local = ~np.isnan(local_canal)
+        if has_local.sum() >= max(3, int(0.3 * len(zz))):
+            is_body = (yy[has_local] < local_canal[has_local]).mean() >= 0.5
+        elif canal_overall_mean is not None:
+            is_body = yy.mean() < canal_overall_mean
         else:
-            # No canal voxel in this column; fall back to all vertebra voxels
-            body_ys = vert_ys
-        if body_ys.size == 0:
-            continue
-        result[x] = body_ys.max()
-    return result
+            is_body = True  # no canal reference anywhere in this slice
+        if is_body:
+            body_components.add(comp_id)
+
+    if not body_components and comp_mean_y:
+        # Degenerate case (e.g. canal mask entirely absent in this slice):
+        # fall back to the single most-anterior component.
+        body_components = {min(comp_mean_y, key=comp_mean_y.get)}
+    return body_components
 
 
-def vertebral_body_anterior_border(arr, z_idx):
-    slice_vert = np.isin(arr[z_idx], list(VERTEBRA_LABELS))
-    n_x = arr.shape[2]
-    result = np.full(n_x, np.nan)
+def compute_vertebral_body_border_maps(arr):
+    """Compute, once per volume, 2D maps (z, x) of the vertebral BODY's
+    posterior-most and anterior-most y index, using per-sagittal-slice (fixed
+    x) connected-component analysis to separate body from posterior elements.
+    Returns (body_post_y, body_ant_y), both shape (n_z, n_x), np.nan where
+    no vertebral body voxel could be classified."""
+    n_z, n_y, n_x = arr.shape
+    vert_mask = np.isin(arr, list(VERTEBRA_LABELS))
+    canal_mask = arr == 100
+
+    body_post_y = np.full((n_z, n_x), np.nan)
+    body_ant_y = np.full((n_z, n_x), np.nan)
+
     for x in range(n_x):
-        vert_ys = np.where(slice_vert[:, x])[0]
-        if vert_ys.size:
-            result[x] = vert_ys.min()
-    return result
+        vert_slice2d = vert_mask[:, :, x]  # (z, y)
+        if not vert_slice2d.any():
+            continue
+        canal_slice2d = canal_mask[:, :, x]
+        labeled, n_components = ndimage.label(vert_slice2d, structure=CC_STRUCTURE)
+        if n_components == 0:
+            continue
+        body_components = _classify_components_as_body(labeled, n_components, canal_slice2d)
+        body_mask2d = np.isin(labeled, list(body_components))
+        for z in range(n_z):
+            ys = np.where(body_mask2d[z])[0]
+            if ys.size:
+                body_post_y[z, x] = ys.max()
+                body_ant_y[z, x] = ys.min()
+
+    return body_post_y, body_ant_y
 
 
-def extract_disc_features(arr, spacing_zyx, disc_label):
+def extract_disc_features(arr, spacing_zyx, disc_label, body_post_y, body_ant_y):
     """arr: (z,y,x) label volume. spacing_zyx: (sz, sy, sx) mm/voxel.
-    Returns a dict of features, or None if disc not present in this volume."""
+    body_post_y / body_ant_y: precomputed (n_z, n_x) vertebral body border
+    maps from compute_vertebral_body_border_maps(). Returns a dict of
+    features, or None if the disc is not present in this volume."""
     sz, sy, sx = spacing_zyx
     disc_mask = arr == disc_label
     canal_mask = arr == 100
@@ -103,12 +156,16 @@ def extract_disc_features(arr, spacing_zyx, disc_label):
     canal_encroach_count = 0
     canal_eval_count = 0
     disc_y_extent_per_xz = []
+    depths = []
 
     for z in z_idxs:
         disc_ys_by_x = disc_mask[z]
-        body_post = vertebral_body_posterior_border(arr, canal_mask, z)
-        body_ant = vertebral_body_anterior_border(arr, z)
         canal_slice = canal_mask[z]
+        body_post_row = body_post_y[z]
+        body_ant_row = body_ant_y[z]
+        valid_depth = ~np.isnan(body_post_row) & ~np.isnan(body_ant_row)
+        if valid_depth.any():
+            depths.append(((body_post_row[valid_depth] - body_ant_row[valid_depth]) * sy).mean())
         for x in range(arr.shape[2]):
             ys = np.where(disc_ys_by_x[:, x])[0]
             if ys.size == 0:
@@ -116,7 +173,7 @@ def extract_disc_features(arr, spacing_zyx, disc_label):
             disc_post_y = ys.max()
             disc_ant_y = ys.min()
             disc_y_extent_per_xz.append((disc_post_y - disc_ant_y) * sy)
-            ref = body_post[x]
+            ref = body_post_row[x]
             if not np.isnan(ref):
                 bulge_mm_per_xz.append((disc_post_y - ref) * sy)
             canal_ys = np.where(canal_slice[:, x])[0]
@@ -138,17 +195,7 @@ def extract_disc_features(arr, spacing_zyx, disc_label):
         - (right_half.max() if right_half.size else 0)
     )
 
-    # Vertebral body AP depth, averaged over slices where disc is present,
-    # used to normalize the bulge measurement to a scale-invariant ratio.
-    depths = []
-    for z in z_idxs:
-        body_post = vertebral_body_posterior_border(arr, canal_mask, z)
-        body_ant = vertebral_body_anterior_border(arr, z)
-        valid = ~np.isnan(body_post) & ~np.isnan(body_ant)
-        if valid.any():
-            depths.append(((body_post[valid] - body_ant[valid]) * sy).mean())
     ap_depth_mm = float(np.mean(depths)) if depths else np.nan
-
     max_bulge_mm = float(bulge_arr.max())
     mean_bulge_mm = float(bulge_arr.mean())
     canal_encroach_frac = (
@@ -171,12 +218,6 @@ def extract_disc_features(arr, spacing_zyx, disc_label):
 def main(masks_dir, overview_csv, gradings_csv, output_csv):
     masks_dir = Path(masks_dir)
 
-    # Build patient -> (chosen mask file, sequence used)
-    patient_ids = sorted(
-        {p.name.split("_")[0] for p in masks_dir.glob("*.mha")},
-        key=lambda s: int(s),
-    )
-
     with open(gradings_csv, encoding="utf-8") as f:
         gradings = list(csv.DictReader(f))
 
@@ -197,16 +238,17 @@ def main(masks_dir, overview_csv, gradings_csv, output_csv):
                 cache_patient[patient] = None
                 continue
             arr, spacing_zyx = load_mask_array(mask_path)
-            cache_patient[patient] = (arr, spacing_zyx, seq_used)
+            body_post_y, body_ant_y = compute_vertebral_body_border_maps(arr)
+            cache_patient[patient] = (arr, spacing_zyx, seq_used, body_post_y, body_ant_y)
 
         entry = cache_patient[patient]
         if entry is None:
             missing_patients.append(patient)
             continue
-        arr, spacing_zyx, seq_used = entry
+        arr, spacing_zyx, seq_used, body_post_y, body_ant_y = entry
 
         disc_label = DISC_LABEL_BASE + ivd_label
-        feats = extract_disc_features(arr, spacing_zyx, disc_label)
+        feats = extract_disc_features(arr, spacing_zyx, disc_label, body_post_y, body_ant_y)
         if feats is None:
             missing_disc_in_mask.append((patient, ivd_label))
             continue
