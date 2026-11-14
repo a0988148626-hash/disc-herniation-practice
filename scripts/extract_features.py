@@ -117,6 +117,10 @@ def _classify_components_as_body(labeled, n_components, canal_slice2d):
         comp_mean_y[comp_id] = yy.mean()
         local_canal = canal_y_per_z[zz]
         has_local = ~np.isnan(local_canal)
+        # Require at least 3 pixels AND 30% local canal coverage before
+        # trusting the local (per-z) canal reference; below that, fall back
+        # to the slice-wide canal mean instead (next branch). Thresholds are
+        # a hand-picked heuristic, not tuned against ground truth.
         if has_local.sum() >= max(3, int(0.3 * len(zz))):
             is_body = (yy[has_local] < local_canal[has_local]).mean() >= 0.5
         elif canal_overall_mean is not None:
@@ -224,7 +228,12 @@ def compute_disc_true_thickness_mm(disc_mask, sy, sz, min_points=6):
         major_axis = eigvecs[:, 1]
         proj_minor = pts @ minor_axis
         thickness_vals.append(proj_minor.max() - proj_minor.min())
-        tilt_angles_deg.append(np.degrees(np.arctan2(abs(major_axis[1]), abs(major_axis[0]) + 1e-12)))
+        # Angle between the major axis and the z (S-I) axis: ~90 deg when the
+        # disc plane is close to horizontal/untilted (major axis mostly in y),
+        # smaller as the plane tilts toward vertical (major axis gains a z
+        # component) - this is the convention used throughout the README
+        # ("smaller angle = more tilted").
+        tilt_angles_deg.append(np.degrees(np.arctan2(abs(major_axis[1]), abs(major_axis[0]))))
     if not thickness_vals:
         return np.nan, np.nan
     return float(np.median(thickness_vals)), float(np.median(tilt_angles_deg))

@@ -34,7 +34,11 @@ def list_folder(path_segment=""):
 
 def download_file(file_id_path, dest_path, retries=4):
     url = f"{BASE}/{file_id_path}"
-    if os.path.exists(dest_path):
+    # size>0, not just exists(): a run interrupted mid-write (timeout, network
+    # drop) leaves a 0-byte file that exists() would wrongly treat as done,
+    # silently skipping it on every rerun (this actually happened once - see
+    # the ID07/BS_L1_2.nii.gz incident in the README).
+    if os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
         return
     for attempt in range(retries):
         try:

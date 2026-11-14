@@ -83,6 +83,8 @@ def main(raw_dir, output_csv):
     rows = []
     pattern = os.path.join(raw_dir, "**", "Labels", "BS_*.nii.gz")
     for path in sorted(glob.glob(pattern, recursive=True)):
+        # Assumes the fixed depth download_tum_labels.py produces:
+        # <raw_dir>/<patient>/<scanner>/Labels/<file>.nii.gz
         parts = path.replace("\\", "/").split("/")
         patient = parts[-4]
         scanner = parts[-3]
