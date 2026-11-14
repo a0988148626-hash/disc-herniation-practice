@@ -28,6 +28,13 @@ CT 的 HU 閾值分割邏輯完全不適用於 MRI 軟組織，因此方法從�
 - **內容**：218 位有下背痛病史的病人、447 份矢狀面 T1/T2（及少量 T2_SPACE）MRI 序列，來自 4 家
   醫院；含椎體／椎間盤／脊椎管分割遮罩，以及獨立的放射科分級 CSV。
 
+另外，外部幾何合理性檢查（見下方專章）用到第二個資料集：**TUM/OSF 多掃描器腰椎資料集**
+（Khalil et al., *Lumbar vertebral body and intervertebral disc segmentation in multi-scanner
+and multi-modal MRI – a ground truth database*, Scientific Data 2022,
+<https://doi.org/10.1038/s41597-022-01222-8>；資料下載自 <https://osf.io/qx5rt>，
+**CC BY 4.0**，34 位病人）。這個資料集只用來檢查方法的幾何輸出是否合理，不用於訓練或正式
+驗證分類器，詳見「外部資料集幾何合理性檢查」專章。
+
 ### 本次實際下載的檔案（經使用者同意，逐一取得明確同意後才下載）
 
 | 檔案 | 大小 | MD5（Zenodo 官方列出） | 本機驗證結果 |
@@ -163,10 +170,16 @@ v2 在方法學上更站得住腳（真的用了影像形狀資訊，不是硬�
 - `max_bulge_mm` / `mean_bulge_mm`：椎間盤後緣超出「椎體後緣估計線」的最大／平均距離
 - `bulge_normalized`：`max_bulge_mm` 除以相鄰椎體前後徑（AP depth），做尺度正規化
 - `asymmetry_mm`：左半邊切片 vs. 右半邊切片的最大突出量差異，粗略偵測是否偏側突出
+- `ap_depth_mm`：相鄰椎體的前後徑（body 前緣到後緣的距離），用來正規化 `bulge_normalized`
 - `canal_encroach_frac`：有多少比例的切片中，椎間盤後緣已經達到或超過脊椎管前緣
   （代表對脊椎管造成壓迫的比例）
 - `mean_disc_ap_extent_mm`：椎間盤在每個切片上的前後徑平均值
 - `n_xz_slices_with_disc`：有效切片數量（資料品質參考，不作為分類特徵）
+
+以上欄位全部會寫進 `results/disc_features.csv`，但實際餵給 `classify.py` 分類器的只有 8 個：
+`disc_height_mm`、`max_bulge_mm`、`mean_bulge_mm`、`bulge_normalized`、`asymmetry_mm`、
+`ap_depth_mm`、`canal_encroach_frac`、`mean_disc_ap_extent_mm`。`disc_height_mm_raw_zextent`、
+`disc_tilt_angle_deg`、`n_xz_slices_with_disc` 只留著做診斷／對照，沒有餵進分類器。
 
 序列選擇：每位病人優先用 `t2`，沒有 t2 才退回 `t1`，兩者都沒有才用 `t2_SPACE`
 （T2 對椎間盤軟組織對比度較好，是臨床慣用的判讀序列；這個選擇未逐一比較 t1/t2 兩者的
@@ -469,6 +482,10 @@ disc_height_mm                -0.009
 
 # 4. 跑分類驗證
 .venv\Scripts\python.exe -I scripts\classify.py results\disc_features.csv results\classification_report.txt
+
+# 5.（選用）外部資料集幾何合理性檢查：下載TUM/OSF資料集的分割遮罩，再跑PCA厚度/傾斜角估計
+.venv\Scripts\python.exe -I external_validation\scripts\download_tum_labels.py external_validation\tum_raw_download
+.venv\Scripts\python.exe -I external_validation\scripts\plausibility_check.py external_validation\tum_raw_download external_validation\tum_plausibility.csv
 ```
 
 ## 資料夾結構
