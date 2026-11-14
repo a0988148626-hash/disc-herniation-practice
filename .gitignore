@@ -1,0 +1,13 @@
+# Python 虛擬環境
+.venv/
+__pycache__/
+*.pyc
+
+# 原始下載壓縮檔（未驗證的外部資料，體積大）——不進版控
+data_raw_download/
+
+# 解壓縮後的真實資料（.mha 分割遮罩、未來若下載的原始MRI影像）——不進版控
+data_extracted/
+
+# 執行輸出（特徵CSV、分類報告）——可由 scripts/ 重跑產生，不進版控
+results/
